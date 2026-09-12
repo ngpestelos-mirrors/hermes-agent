@@ -49,6 +49,37 @@ If `model.default` in `config.yaml` names something other than `nous/welcome` wh
 is doing inference, Hermes uses `nous/welcome` anyway and says so in one line. The free tier
 serves exactly one model.
 
+## Continuing after the first ten tool calls
+
+The welcome model includes **ten completed tool calls after onboarding**, shared for the
+lifetime of the same free-tier identity across sessions and profiles. The canonical welcome
+guide does not count toward this allowance and is never gated. Failed tool executions count
+when they return a result; tools refused before execution do not. Delegated child tools and
+nested tool calls count too, without counting a connector-batch envelope a second time.
+
+If the allowance is reached during a turn, Hermes finishes that turn—including its remaining
+tools—and then asks you to **sign in with `/login`**, or use **`/model`** to choose a local model
+or another provider, including OAuth subscriptions. Further welcome-model turns wait for that change. A new session,
+profile switch, or restart does not reset the allowance. Starting sign-in is not enough:
+it must complete. Other providers and named Nous accounts are unaffected.
+
+The notice is display-only: it does not rewrite model history or the cached prompt. Refused
+prompts do not enter conversation history. Queued TUI/Desktop prompts remain queued while
+continuation is required, and settings, sign-in, and model commands remain available.
+
+For clients, `free_tier.status` adds `tool_calls_used`, `tool_call_cap`, and `capped` (local,
+identity-level state, not a claim about the selected inference route). With `session_id`, or
+`model` / `provider` for a new chat, status also returns route-specific `continuation_required`.
+A capped new-chat route check may resolve credentials; ordinary identity polling stays local.
+Turn results expose
+`free_tier` plus route-specific `continuation_required`. A blocked `prompt.submit` returns RPC
+error `4092`, with `data.reason: "free_tier_limit"`, `data.retryable: true`, and `data.free_tier`.
+A deferred/core refusal uses `refusal_reason` / `failure_reason: "free_tier_limit"`,
+`failed: true`, `completed: false`, `failure_retryable: false` (no automatic retry),
+`retryable: true` (user recovery), unchanged `messages`, and the actionable `final_response`.
+The sticky notification key is `free_tier.limit`. Guide provisioning uses
+`profiles.ensure_onboarding({soul})`, not a name-only exemption on arbitrary profiles.
+
 ## Using your own API key alongside it
 
 The free tier is the last resort, never a preference. Any provider you configure wins:
