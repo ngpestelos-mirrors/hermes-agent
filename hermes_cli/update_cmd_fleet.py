@@ -5,6 +5,7 @@ Split out of ``hermes_cli/update_cmd.py``; every name is re-imported there so
 imported lazily inside each function (no import cycle; test patches stay effective).
 """
 
+import json
 import logging
 from contextlib import suppress
 import os
@@ -50,7 +51,7 @@ def _fleet_restart_pending_marker_path() -> Path:
     return get_hermes_home() / _FLEET_RESTART_PENDING_NAME
 
 
-def _write_fleet_restart_pending_marker(*, expected_sha: str = "") -> None:
+def _write_fleet_restart_pending_marker(*, expected_sha: str = "", runtimes: list[dict] | None = None) -> None:
     """Drop the pull→restart obligation breadcrumb. Never raises."""
     from hermes_cli.update_cmd import _m
     path = _fleet_restart_pending_marker_path()
@@ -61,6 +62,8 @@ def _write_fleet_restart_pending_marker(*, expected_sha: str = "") -> None:
         lines = [f"started={_time.time()}", f"pid={os.getpid()}"]
         if expected_sha:
             lines.append(f"expected_sha={expected_sha}")
+        if runtimes is not None:
+            lines.append("inventory=" + json.dumps({"version": 1, "runtimes": runtimes}))
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     except OSError as exc:
         logger.debug("Could not write fleet-restart-pending marker: %s", exc)
@@ -196,29 +199,39 @@ def _live_fleet_covers_receipt(expected_sha: str | None, receipt: dict, owed: se
         return False
 
 
-def _read_fleet_marker_expected_sha() -> str:
-    """``expected_sha`` recorded in the pending marker ("" when absent/unreadable)."""
-    with suppress(OSError):
-        for line in _fleet_restart_pending_marker_path().read_text(encoding="utf-8").splitlines():
-            if line.startswith("expected_sha="):
-                return line.split("=", 1)[1].strip()
-    return ""
+def _marker_only_restart_obsolete() -> bool:
+    """Settle only the inventory stored with this marker's target SHA.
 
-
-def _marker_only_restart_obsolete(owed: set[tuple[str, str]] | None) -> bool:
-    """Discharge a legacy marker after an externally completed gateway restart.
-
-    Require a nonempty snapshot of current, known-profile gateways at the marker's expected SHA, no checkout movement, and coverage of every receipt-owed gateway. Failed probes, stale/down/unknown rows and missing target SHAs retain the marker.
-
-    Unlike receipt-only settlement, an empty live fleet never suffices: stopped gateways can disappear from startup discovery. Even a same-SHA manual-only receipt cannot establish ownership of this marker.
-
-    This preserves the legacy nonempty reconciliation policy, not a complete inventory guarantee. An unrelated older receipt can omit gateways owed by a later update; stronger guarantees require a marker-owned inventory.
+    Historical receipts cannot narrow this obligation. Legacy, malformed or unsupported inventories stay fail-closed; empty discovery never proves a stopped gateway recovered.
     """
-    expected_sha = _read_fleet_marker_expected_sha()
+    try:
+        fields = {}
+        for line in _fleet_restart_pending_marker_path().read_text(encoding="utf-8").splitlines():
+            key, value = line.split("=", 1)
+            if key in fields:
+                return False
+            fields[key] = value
+        expected_sha = fields.get("expected_sha", "").strip()
+        inventory = json.loads(fields.get("inventory", "null"))
+        if not isinstance(inventory, dict) or inventory.get("version") != 1:
+            return False
+        runtimes = inventory.get("runtimes")
+        if not isinstance(runtimes, list) or not runtimes:
+            return False
+        owed = set()
+        for runtime in runtimes:
+            if not isinstance(runtime, dict) or runtime.get("kind") != "gateway":
+                return False
+            profile = runtime.get("profile")
+            if not isinstance(profile, str) or not profile.strip() or profile == "unknown":
+                return False
+            owed.add(("gateway", profile))
+    except (OSError, UnicodeError, ValueError):
+        return False
     if not expected_sha:
-        return False  # pre-expected_sha marker: nothing to verify against
+        return False
     checkout_sha = _current_checkout_sha()
-    if checkout_sha and checkout_sha != expected_sha:
+    if checkout_sha != expected_sha:
         return False  # a newer pull moved HEAD; it owns a fresh obligation
     try:
         from hermes_cli.update_receipt import collect_fleet_versions
@@ -227,7 +240,7 @@ def _marker_only_restart_obsolete(owed: set[tuple[str, str]] | None) -> bool:
         logger.debug("Fleet probe failed; keeping fleet-restart-pending marker: %s", exc)
         return False
     if not fleet:
-        return False  # Absence cannot discharge a marker with no owning inventory.
+        return False  # Absence cannot prove recovery of the recorded inventory.
     for row in fleet:
         if not isinstance(row, dict):
             return False
@@ -236,8 +249,8 @@ def _marker_only_restart_obsolete(owed: set[tuple[str, str]] | None) -> bool:
             return False  # unidentified runtime: the matrix cannot vouch for it
         if row.get("state") != "current" or str(row.get("code_sha")) != expected_sha:
             return False  # stale / down / unknown-identity row still owes the restart
-    if owed is None or not owed <= {("gateway", row.get("profile")) for row in fleet}:
-        return False  # a gateway the receipt owes is absent (down) or unidentifiable
+    if not owed <= {("gateway", row.get("profile")) for row in fleet}:
+        return False  # A gateway this marker owns is absent.
     _clear_fleet_restart_pending_marker()
     logger.debug(
         "Fleet-restart-pending marker discharged: %d gateway(s) already serve %s",
@@ -256,14 +269,13 @@ def _pending_fleet_restart_needed(*, receipt: dict | None = None, pending_manual
         receipt = read_latest_receipt() or {}
     if pending_manual is None:
         pending_manual = retain_receipt_manual_serves(receipt)
-    owed = _receipt_owed_gateways(receipt, pending_manual)
-    # The marker has no runtime inventory and may belong to a newer, killed update
-    # than latest.json. An older receipt cannot discharge that unknown obligation.
+    # A marker owns its inventory; latest.json can belong to an older update.
     with suppress(OSError):
         if _fleet_restart_pending_marker_path().is_file():
-            if _marker_only_restart_obsolete(owed):
+            if _marker_only_restart_obsolete():
                 return False
             return True
+    owed = _receipt_owed_gateways(receipt, pending_manual)
     if not _receipt_reports_stale_runtime(receipt):
         return False
     return not _live_fleet_covers_receipt(_current_checkout_sha(), receipt, owed)

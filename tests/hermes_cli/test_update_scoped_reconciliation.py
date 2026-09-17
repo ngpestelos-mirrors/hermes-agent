@@ -1,4 +1,4 @@
-"""Historical receipts cannot lend ownership to an empty marker observation."""
+"""Marker settlement uses its own inventory, never a historical receipt's ownership."""
 
 import json
 
@@ -43,7 +43,11 @@ def seed(monkeypatch, old, marker, live, alive=True):
 
 @pytest.mark.parametrize("name,old,marker,live,pending", CASES, ids=[case[0] for case in CASES])
 def test_scoped_reconciliation_matrix(monkeypatch, capsys, name, old, marker, live, pending):
+    live = list(live)
     target = seed(monkeypatch, old, marker, live)
+    if name in ("marker-external-restart", "missing-sibling", "checkout-moved"):
+        runtimes = [GATEWAY, dict(GATEWAY, profile="beta")] if name == "missing-sibling" else [GATEWAY]
+        fleet._write_fleet_restart_pending_marker(expected_sha=marker, runtimes=runtimes)
     before = target.read_bytes()
     assert fleet._pending_fleet_restart_needed() is pending
     fleet._warn_pending_fleet_restart_on_startup()
@@ -53,6 +57,11 @@ def test_scoped_reconciliation_matrix(monkeypatch, capsys, name, old, marker, li
     assert ("fleet restart deferred" in capsys.readouterr().out) is pending
     assert target.read_bytes() == before
     assert fleet._fleet_restart_pending_marker_path().exists() is (marker is not None and pending)
+    if name == "missing-sibling":
+        live.append(dict(CURRENT, profile="beta"))
+        assert not fleet._pending_fleet_restart_needed()
+        assert not fleet._fleet_restart_pending_marker_path().exists()
+        assert target.read_bytes() == before
 
 
 @pytest.mark.parametrize("alive", [True, False, None], ids=["alive", "dead", "unknown"])
@@ -96,6 +105,8 @@ def test_reconciliation_uses_one_receipt_snapshot(monkeypatch, capsys, consumer)
 def test_probe_exception_does_not_hide_manual_warning(monkeypatch, capsys, marker, blocked_storage):
     old = {"outcome": "partial", "plan": {"runtimes": [GATEWAY, MANUAL]}}
     target = seed(monkeypatch, old, marker, [])
+    if marker is not None:
+        fleet._write_fleet_restart_pending_marker(expected_sha=marker, runtimes=[GATEWAY])
     before = target.read_bytes()
     if blocked_storage:
         (get_hermes_home() / "serve_restart_pending").write_text("not a directory")
@@ -112,8 +123,80 @@ def test_probe_exception_does_not_hide_manual_warning(monkeypatch, capsys, marke
     assert target.read_bytes() == before
 
 
+@pytest.mark.parametrize("legacy", [False, True], ids=["owned-inventory", "legacy-marker"])
+def test_new_marker_cannot_borrow_old_alpha_receipt(monkeypatch, capsys, legacy):
+    """N owns alpha; N+1 owns alpha and beta but dies before writing its receipt."""
+    old = {"outcome": "failed", "plan": {"runtimes": [GATEWAY]}}
+    live = [CURRENT]
+    target = seed(monkeypatch, old, "new", live)
+    marker = fleet._fleet_restart_pending_marker_path()
+    if not legacy:
+        with marker.open("a") as stream:
+            stream.write("inventory=" + json.dumps({"version": 1, "runtimes": [GATEWAY, dict(GATEWAY, profile="beta")]}) + "\n")
+    receipt_before, marker_before = target.read_bytes(), marker.read_bytes()
+    fleet._warn_pending_fleet_restart_on_startup()
+    assert "hermes gateway restart" in capsys.readouterr().err
+    assert fleet._pending_fleet_restart_needed()
+    fleet._apply_pending_fleet_restart_catchup(defer=True)
+    assert "fleet restart deferred" in capsys.readouterr().out
+    assert marker.read_bytes() == marker_before
+    assert target.read_bytes() == receipt_before
+    live.append(dict(CURRENT, profile="beta"))
+    assert fleet._pending_fleet_restart_needed() is legacy
+    assert marker.exists() is legacy
+    assert target.read_bytes() == receipt_before
+
+
+@pytest.mark.parametrize("inventory", [None, {}, [], {"version": 2, "runtimes": [GATEWAY]}, {"version": 1, "runtimes": []}, {"version": 1, "runtimes": [GATEWAY, MANUAL]}, {"version": 1, "runtimes": [None]}, {"version": 1, "runtimes": [{"kind": "gateway", "profile": "unknown"}]}, {"version": 1, "runtimes": [{"kind": "gateway", "profile": []}]}])
+def test_unverified_marker_inventory_stays_pending(monkeypatch, inventory):
+    seed(monkeypatch, {"outcome": "success", "plan": {"runtimes": [GATEWAY]}}, "new", [CURRENT])
+    marker = fleet._fleet_restart_pending_marker_path()
+    with marker.open("a") as stream:
+        stream.write("inventory=" + json.dumps(inventory) + "\n")
+    before = marker.read_bytes()
+    assert fleet._pending_fleet_restart_needed()
+    assert marker.read_bytes() == before
+
+
+@pytest.mark.parametrize("suffix", ['inventory={', 'inventory=null\ninventory={"version":1,"runtimes":[]}', 'broken-line'])
+def test_malformed_marker_stays_pending(monkeypatch, suffix):
+    seed(monkeypatch, {}, "new", [CURRENT])
+    marker = fleet._fleet_restart_pending_marker_path()
+    with marker.open("a") as stream:
+        stream.write(suffix + "\n")
+    assert fleet._pending_fleet_restart_needed()
+    assert marker.exists()
+
+
+def test_pulled_update_marker_owns_pre_update_inventory(monkeypatch):
+    from types import SimpleNamespace
+    from hermes_cli import update_cmd
+    from hermes_cli.update_inventory import RuntimeRecord, UpdatePlan
+
+    old = {"outcome": "failed", "plan": {"runtimes": [GATEWAY]}}
+    target = seed(monkeypatch, old, None, [CURRENT])
+    before = target.read_bytes()
+    plan = UpdatePlan(runtimes=[RuntimeRecord(kind="gateway", profile=p) for p in ("alpha", "beta")])
+    monkeypatch.setattr(update_cmd, "_invalidate_update_cache", lambda: None)
+    monkeypatch.setattr(update_cmd, "_verify_head_after_pull", lambda *a, **k: "new")
+
+    def interrupt(*args):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(update_cmd, "_sweep_bytecode_after_update", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        update_cmd._apply_pulled_update([], "main", "old", SimpleNamespace(in_place_update=True), None, gateway_mode=False, is_fork=False, desktop_dir=None, had_desktop_app_before_update=False, pre_update_snapshot_id=None, _pre_update_plan=plan, _windows_gateway_resume=None)
+    marker = fleet._fleet_restart_pending_marker_path()
+    fields = dict(line.split("=", 1) for line in marker.read_text().splitlines())
+    assert fields["expected_sha"] == "new"
+    assert json.loads(fields["inventory"]) == {"version": 1, "runtimes": plan.to_dict()["runtimes"]}
+    assert fleet._pending_fleet_restart_needed()
+    assert target.read_bytes() == before
+
+
 def test_marker_reconciliation_collects_one_live_snapshot(monkeypatch):
     seed(monkeypatch, {}, "new", [CURRENT])
+    fleet._write_fleet_restart_pending_marker(expected_sha="new", runtimes=[GATEWAY])
     probes = []
 
     def collect(**kwargs):
