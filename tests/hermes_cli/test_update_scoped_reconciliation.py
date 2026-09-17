@@ -52,7 +52,7 @@ def test_scoped_reconciliation_matrix(monkeypatch, capsys, name, old, marker, li
     assert fleet._pending_fleet_restart_needed() is pending
     fleet._warn_pending_fleet_restart_on_startup()
     assert ("hermes gateway restart" in capsys.readouterr().err) is pending
-    # Catch-up must share the warning decision without restarting from a cron caller.
+    # These unfinished receipts require the same evidence for startup and deferred catch-up.
     fleet._apply_pending_fleet_restart_catchup(defer=True)
     assert ("fleet restart deferred" in capsys.readouterr().out) is pending
     assert target.read_bytes() == before
@@ -123,10 +123,13 @@ def test_probe_exception_does_not_hide_manual_warning(monkeypatch, capsys, marke
     assert target.read_bytes() == before
 
 
+@pytest.mark.parametrize("completed_restart", [False, True])
 @pytest.mark.parametrize("legacy", [False, True], ids=["owned-inventory", "legacy-marker"])
-def test_new_marker_cannot_borrow_old_alpha_receipt(monkeypatch, capsys, legacy):
+def test_new_marker_cannot_borrow_old_alpha_receipt(monkeypatch, capsys, legacy, completed_restart):
     """N owns alpha; N+1 owns alpha and beta but dies before writing its receipt."""
     old = {"outcome": "failed", "plan": {"runtimes": [GATEWAY]}}
+    if completed_restart:
+        old.update(post_update={"sha": "new"}, gateway_restart={"incomplete": False})
     live = [CURRENT]
     target = seed(monkeypatch, old, "new", live)
     marker = fleet._fleet_restart_pending_marker_path()
@@ -185,7 +188,7 @@ def test_pulled_update_marker_owns_pre_update_inventory(monkeypatch):
 
     monkeypatch.setattr(update_cmd, "_sweep_bytecode_after_update", interrupt)
     with pytest.raises(KeyboardInterrupt):
-        update_cmd._apply_pulled_update([], "main", "old", SimpleNamespace(in_place_update=True), None, gateway_mode=False, is_fork=False, desktop_dir=None, had_desktop_app_before_update=False, pre_update_snapshot_id=None, _pre_update_plan=plan, _windows_gateway_resume=None)
+        update_cmd._apply_pulled_update([], "main", "old", SimpleNamespace(in_place_update=True), None, gateway_mode=False, is_fork=False, desktop_dir=None, had_desktop_app_before_update=False, pre_update_snapshot_id=None, _pre_update_plan=plan, _windows_gateway_resume=None, args=SimpleNamespace())
     marker = fleet._fleet_restart_pending_marker_path()
     fields = dict(line.split("=", 1) for line in marker.read_text().splitlines())
     assert fields["expected_sha"] == "new"

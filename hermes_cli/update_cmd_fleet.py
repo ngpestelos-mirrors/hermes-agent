@@ -171,13 +171,8 @@ def _receipt_owed_gateways(receipt: dict, pending_manual: list[dict]) -> set[tup
     return None if unverified else owed
 
 
-def _live_fleet_covers_receipt(expected_sha: str | None, receipt: dict, owed: set[tuple[str, str]] | None) -> bool:
-    """Require current successors for every recorded runtime, not just any live row.
-
-    A PID changes on restart; the stable identity is (runtime kind, profile).
-    The gateway matrix cannot vouch for serve/dashboard or unidentified runtimes.
-    Keep the historical receipt intact: a manual restart is not a successful update.
-    """
+def _live_fleet_covers_receipt(expected_sha: str | None, receipt: dict, owed: set[tuple[str, str]] | None, *, accept_states: tuple = ("current",)) -> bool:
+    """Require a successor at the expected SHA for every owed gateway identity."""
     if not expected_sha:
         return False
     from hermes_cli.update_receipt import collect_fleet_versions
@@ -188,8 +183,9 @@ def _live_fleet_covers_receipt(expected_sha: str | None, receipt: dict, owed: se
         if not owed:
             return bool((receipt.get("plan") or {}).get("runtimes"))
         fleet = collect_fleet_versions()
+        # State labels are checkout-relative; completed restarts may accept stale rows at the pulled SHA.
         if not fleet or any(
-            row.get("state") != "current" or row.get("code_sha") != expected_sha
+            row.get("state") not in accept_states or row.get("code_sha") != expected_sha
             for row in fleet
         ):
             return False
@@ -259,8 +255,19 @@ def _marker_only_restart_obsolete() -> bool:
     return True
 
 
+def _receipt_restart_phase_completed(receipt: dict) -> str | None:
+    """Return the pulled SHA when the restart phase completed, even if a later step failed."""
+    gateway_restart = receipt.get("gateway_restart")
+    if not isinstance(gateway_restart, dict) or not gateway_restart:
+        return None
+    if gateway_restart.get("incomplete") or gateway_restart.get("phase_error"):
+        return None
+    post_sha = (receipt.get("post_update") or {}).get("sha")
+    return str(post_sha) if post_sha else None
+
+
 def _pending_fleet_restart_needed(*, receipt: dict | None = None, pending_manual: list[dict] | None = None) -> bool:
-    """Reconcile old restart obligations against current, identity-matched gateways."""
+    """Require identity-matched gateways at checkout HEAD for update catch-up."""
     from hermes_cli.update_cmd import _current_checkout_sha
     from hermes_cli.update_receipt import read_latest_receipt
     from hermes_cli.update_serve_obligations import retain_receipt_manual_serves
@@ -272,12 +279,33 @@ def _pending_fleet_restart_needed(*, receipt: dict | None = None, pending_manual
     # A marker owns its inventory; latest.json can belong to an older update.
     with suppress(OSError):
         if _fleet_restart_pending_marker_path().is_file():
-            if _marker_only_restart_obsolete():
-                return False
-            return True
+            return not _marker_only_restart_obsolete()
     owed = _receipt_owed_gateways(receipt, pending_manual)
     if not _receipt_reports_stale_runtime(receipt):
         return False
+    return not _live_fleet_covers_receipt(_current_checkout_sha(), receipt, owed)
+
+
+def _update_owes_fleet_restart(*, receipt: dict | None = None, pending_manual: list[dict] | None = None) -> bool:
+    """Hold a completed restart to the code it pulled, not a later checkout HEAD."""
+    from hermes_cli.update_cmd import _current_checkout_sha
+    from hermes_cli.update_receipt import read_latest_receipt
+    from hermes_cli.update_serve_obligations import retain_receipt_manual_serves
+
+    if receipt is None:
+        receipt = read_latest_receipt() or {}
+    if pending_manual is None:
+        pending_manual = retain_receipt_manual_serves(receipt)
+    # A completed older receipt cannot discharge an independent marker's inventory.
+    with suppress(OSError):
+        if _fleet_restart_pending_marker_path().is_file():
+            return not _marker_only_restart_obsolete()
+    owed = _receipt_owed_gateways(receipt, pending_manual)
+    if not _receipt_reports_stale_runtime(receipt):
+        return False
+    restarted_to = _receipt_restart_phase_completed(receipt)
+    if restarted_to:
+        return not _live_fleet_covers_receipt(restarted_to, receipt, owed, accept_states=("current", "stale"))
     return not _live_fleet_covers_receipt(_current_checkout_sha(), receipt, owed)
 
 
@@ -300,7 +328,7 @@ def _warn_pending_fleet_restart_on_startup() -> None:
     with suppress(Exception):
         pending_manual = retain_receipt_manual_serves(receipt)
     with suppress(Exception):
-        if _pending_fleet_restart_needed(receipt=receipt, pending_manual=pending_manual):
+        if _update_owes_fleet_restart(receipt=receipt, pending_manual=pending_manual):
             _warn_pending_fleet_restart(startup=True)
     with suppress(Exception):
         warn_pending_manual_serves(startup=True, pending_manual=pending_manual)
@@ -367,8 +395,6 @@ def _run_pending_fleet_restart() -> bool:
     """
     from hermes_cli.update_cmd import _m
     print("→ Restarting gateways left on pre-update code...")
-    with suppress(Exception):
-        _m()._purge_stale_hermes_modules()
     # Warn if legacy Hermes gateway unit files are still installed. When both hermes.service (from a
     # pre-rename install) and the current hermes-gateway.service are enabled, they SIGTERM-fight for the
     # same bot token (see PR #11909). Flagging here means every `hermes update` surfaces the issue until the
@@ -1351,10 +1377,6 @@ def _restart_gateway_fleet_after_update(_pre_update_plan, gateway_mode: bool):
     # already-restarted units to ``_finish_dashboard_update_cleanup`` (review on #83595).
     restarted_scoped_units: set = set()
 
-    # Purge stale cached Hermes modules FIRST: the import below loads new gateway
-    # source into this pre-update interpreter, and a cached sibling missing a
-    # symbol the new source expects would ImportError and abort the whole phase.
-    _m()._purge_stale_hermes_modules()
     try:
         # Every gateway helper the phase needs is imported up front so a broken gateway
         # module aborts into recovery BEFORE any unit is touched.
@@ -1438,36 +1460,59 @@ def _collect_fleet_snapshot(restart, rows_expected: bool) -> list:
     so a single 2s sleep reported "no rows" on healthy resumes. A "down" row may be a
     detached replacement still booting: poll until none remain or the deadline passes.
     Pre-restart PIDs make a gateway stopped WITHOUT verified replacement a DOWN row (exit 1)
-    instead of no row at all.
+    instead of no row at all. An ``unknown`` row whose pid is NOT a pre-restart pid is a successor
+    that has not published its code identity yet (a relaunched gateway can sit ~10s between process
+    start and its first runtime-status write, #112634) — keep polling; at the deadline it is flagged
+    ``identity_pending`` so the matrix does not call it a pre-stamping gateway.
     """
     from hermes_cli.update_receipt import collect_fleet_versions
     if not rows_expected:
         return collect_fleet_versions(pre_restart_pids=restart.pre_restart_gateway_pids)
+    pre_pids = restart.pre_restart_gateway_pids
     _fleet_deadline = _time.monotonic() + _FLEET_PROBE_SETTLE_TIMEOUT_SECONDS
     while True:
         _time.sleep(2.0)
-        snapshot = collect_fleet_versions(pre_restart_pids=restart.pre_restart_gateway_pids)
-        if snapshot and not any(row.get("state") == "down" for row in snapshot):
+        snapshot = collect_fleet_versions(pre_restart_pids=pre_pids)
+        pending = [row for row in snapshot if _fleet_row_identity_pending(row, pre_pids)]
+        if snapshot and not pending and not any(row.get("state") == "down" for row in snapshot):
             return snapshot
         if _time.monotonic() >= _fleet_deadline or _restarted_units_gone(
                 getattr(restart, "restarted_scoped_units", ())):
+            for row in pending:
+                row["identity_pending"] = True
             return snapshot
 
 
+def _fleet_row_identity_pending(row: dict, pre_restart_pids) -> bool:
+    """An ``unknown`` row with no sha from a pid that did not exist at update start: a relaunched
+    gateway still booting, not a gateway that predates version stamping. A surviving pre-restart pid
+    (or no pid snapshot at all) is settled as-is — waiting cannot change what it publishes."""
+    if row.get("state") != "unknown" or row.get("code_sha"):
+        return False
+    if pre_restart_pids is None:
+        return False
+    return row.get("pid") not in {int(p) for p in pre_restart_pids if isinstance(p, int)}
+
+
 def _restarted_units_gone(scoped_units) -> bool:
-    """True when every restarted systemd unit is neither active nor activating: the successor died,
-    nothing will publish a state stamp, so the settle poll should fail closed now instead of at the
-    deadline. Unknown (no units, systemctl missing/slow) keeps waiting."""
+    """True when every restarted systemd unit is LOADED in its scope and neither active nor
+    activating: the successor died, nothing will publish a state stamp, so the settle poll should fail
+    closed now instead of at the deadline. Anything inconclusive keeps waiting: no units, systemctl
+    missing/slow, or ``LoadState=not-found`` — a unit name asked in a scope that does not own it
+    answers ``inactive`` exactly like a dead unit (#112466), so only a loaded unit can prove death."""
     if not scoped_units:
         return False
     scope_cmds = dict(_SYSTEMD_SCOPES)
     for scoped in scoped_units:
         scope, _, name = scoped.partition("/")
         try:
-            state = _systemctl(scope_cmds[scope] + ["is-active", name], timeout=5).stdout.strip()
+            stdout = _systemctl(scope_cmds[scope] + ["show", "-p", "LoadState,ActiveState", name], timeout=5).stdout
         except (KeyError, FileNotFoundError, subprocess.TimeoutExpired):
             return False
-        if state in ("active", "activating", "reloading"):
+        props = dict(line.split("=", 1) for line in stdout.splitlines() if "=" in line)
+        if props.get("LoadState") != "loaded":
+            return False
+        if props.get("ActiveState") in ("active", "activating", "reloading"):
             return False
     return True
 
