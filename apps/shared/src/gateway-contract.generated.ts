@@ -3722,6 +3722,7 @@ export interface AgentPluginRow {
   portable: boolean
   install_dir: string
   has_desktop_half: boolean
+  servers: PluginServerRow[]
   catalog_name?: string | null
   catalog_tier?: string | null
   installed_sha?: string | null
@@ -3730,6 +3731,12 @@ export interface AgentPluginRow {
   update_available?: boolean | null
   pinned_sha?: string | null
 }
+export interface PluginServerRow {
+  name: string
+  state: PluginServerState
+  sentence: string
+}
+export type PluginServerState = 'connected' | 'app_not_running' | 'endpoint_unavailable' | 'no_interactive_session' | 'version_too_old' | 'missing_app' | 'unknown'
 /** Single question: ``question`` / ``choices`` (/ ``multi_select``); batch: ``questions``. ``answers`` rides only on a reconnect replay (locks the server already accepted). */
 export interface ClarifyRequestParams {
   session_id: string
