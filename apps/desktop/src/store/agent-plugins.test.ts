@@ -1,9 +1,25 @@
 import { describe, expect, it } from 'vitest'
 
-import { type AgentPluginRow, isDesktopRelevantPlugin } from './agent-plugins'
+import { type AgentPluginRow, isDesktopRelevantPlugin, normalizeAgentPluginRow } from './agent-plugins'
 
 const row = (partial: Partial<AgentPluginRow>): AgentPluginRow =>
   ({ name: partial.key ?? 'x', status: 'enabled', ...partial }) as AgentPluginRow
+
+describe('normalizeAgentPluginRow', () => {
+  it('treats an absent servers field as an empty full snapshot', () => {
+    const previous = normalizeAgentPluginRow(
+      row({
+        key: 'example-plugin',
+        servers: [{ name: 'example-server', sentence: '', state: 'connected' }],
+        source: 'user'
+      })
+    )
+    const next = normalizeAgentPluginRow(row({ key: 'example-plugin', source: 'user' }))
+
+    expect(previous.servers).toHaveLength(1)
+    expect(next.servers).toEqual([])
+  })
+})
 
 describe('isDesktopRelevantPlugin (#98861)', () => {
   it('lists the manageable bundled lifecycle plugins and keeps every other built-in hidden', () => {
