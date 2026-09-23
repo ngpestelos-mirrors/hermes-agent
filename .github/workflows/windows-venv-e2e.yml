@@ -52,6 +52,20 @@ jobs:
         with:
           command: uv sync --locked --python 3.11 --extra dev --extra messaging
 
+      - name: TEMP ConPTY stdin readiness loop under CPU load (#98556)
+        shell: bash
+        run: |
+          set -u
+          for n in $(seq 1 12); do uv run --no-sync python -c "while True: pass" & done
+          sleep 3
+          fails=0
+          for i in $(seq 1 40); do
+            uv run --no-sync python -m pytest tests/hermes_cli/test_win_pty_bridge.py -k test_write_sends_to_child_stdin -o addopts= -q -p no:cacheprovider > out.txt 2>&1 || { fails=$((fails+1)); tail -5 out.txt; }
+          done
+          echo "RESULT fails=$fails/40"
+          kill $(jobs -p) 2>/dev/null || true
+          test $fails -eq 0
+
       - name: Run venv-holder live E2E
         shell: bash
         run: |
