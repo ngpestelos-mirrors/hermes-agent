@@ -244,6 +244,35 @@ def interrupted_pull_marker(root: Path) -> Path:
     return _git_dir(root) / INTERRUPTED_PULL_MARKER
 
 
+def _git_executable() -> str:
+    """The git ``hermes update`` runs (``_subprocess_compat.expose_pm_git``), without installing it.
+
+    PATH's git first. A Windows install whose only git is the one install.ps1 staged in PM's store
+    has none on PATH until the updater exposes it, so this falls back to that copy: PM's recorded
+    entry, or the lockfile's pinned entry the installer extracted without recording it. A bare
+    ``git`` there dies with WinError 2 and the torn tree this repair exists for stays torn.
+    """
+    import shutil
+
+    found = shutil.which("git")
+    if found:
+        return found
+    with contextlib.suppress(Exception):  # no PM, no store, no Windows git package: PATH's answer stands
+        import pm
+        from pm import paths
+        from pm.lock import Lockfile
+
+        recorded = pm.installed_package("git", allow_outdated=True)
+        if recorded is not None and recorded.binary is not None and recorded.binary.is_file():
+            return str(recorded.binary)
+        package, target = pm.get_package("git"), pm.current_target()
+        version = Lockfile(paths.lockfile_path()).version("git")
+        staged = package.binary(paths.store_root() / package.store_entry(version, target), target)
+        if staged is not None and staged.is_file():
+            return str(staged)
+    return "git"
+
+
 def _trees_git_could_write(git, pre: str, target: str) -> tuple[list[str], set[str]]:
     """The trees the killed git was moving the checkout to, and the paths whose new content is unknowable.
 
@@ -315,9 +344,12 @@ def _paths_git_wrote(git, root: Path, pre: str, target: str) -> tuple[list[str],
             written = True
         else:  # git's own file cut short starts one of the new blobs
             content = file.read_bytes()
-            written = any(subprocess.run(["git", "-C", str(root), "cat-file", "--filters", f"--path={path}", blob],
-                                         capture_output=True, check=True, timeout=120,
-                                         stdin=subprocess.DEVNULL).stdout.startswith(content) for blob in blobs)
+            written = False
+            for blob in blobs:
+                shown = git("cat-file", "--filters", f"--path={path}", blob, text=False)
+                if shown.returncode != 0:
+                    raise subprocess.SubprocessError(shown.stderr.decode(errors="replace").strip())
+                written = written or shown.stdout.startswith(content)
         if written:
             (added if old_blob is None else restore).append(path)
     new_dirs = {str(parent) for path, (_m, old_blob, _n) in entries.items() if old_blob is None
@@ -390,34 +422,112 @@ def _restore_claim(git_dir: Path):
         os.close(fd)
 
 
-def _held_open(path: Path) -> bool:
-    """True when a running process has ``path`` open, the usual sign of a live git owning its lock.
+class _Holder(str):
+    """A process that may own a git lock, e.g. ``pid 4242 (git commit)``: truthy, and never ``is True``."""
 
-    Best effort, not exact: Linux answers through /proc, but a live git that owns ``index.lock`` without
-    an open fd (``commit`` waiting in the editor, or between closing the lock and renaming it) reads as
-    dead; Windows refuses to unlink a file another process has open, so the caller's unlink is its probe;
-    macOS/BSD have no portable check at all. The claim only orders Hermes launches, so on those paths a
-    live git's lock can be removed; its command then fails and the marker stays for the next launch.
+
+# Git subcommands that can keep ``index.lock`` (or a ref lock) with its fd CLOSED while they wait
+# (``commit``/``merge``/``rebase``/``tag``... in the editor). A reader in the tree (``git log`` in a
+# pager, ``git status``, ``gitstatusd``, the fsmonitor daemon) is not one: while it really holds a lock
+# its open fd names it.
+_LOCK_KEEPING_GIT = frozenset({
+    "am", "cherry-pick", "commit", "merge", "pull", "rebase", "revert", "stash", "tag", "notes",
+})
+
+
+def _git_subcommand_of(cmdline: bytes) -> str | None:
+    args = [a.decode("utf-8", "replace") for a in cmdline.split(b"\0") if a][1:]
+    it = iter(args)
+    for arg in it:
+        if arg in ("-c", "-C", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"):
+            next(it, None)
+        elif not arg.startswith("-"):
+            return arg
+    return None
+
+
+def _held_open(path: Path, root: Path | None = None) -> _Holder | bool | None:
+    """Whether a running process may still own ``path`` (a git lock): the holder, False, or None (unknowable).
+
+    The holder is a truthy :class:`_Holder` naming it (``pid 4242 (git commit)``). False is proof, not
+    a guess: Linux reads every process's fds through /proc and also counts any live ``git`` working
+    inside ``root`` whose subcommand can keep ``index.lock`` with its fd closed (``commit`` waiting in
+    the editor, :data:`_LOCK_KEEPING_GIT`); readers there (a paged ``git log``, ``gitstatusd``, the
+    fsmonitor daemon) only count while their fd is on the lock. macOS/BSD ask ``lsof``. Without either
+    check the answer is None and the caller never deletes the lock. Windows needs no answer here: it
+    refuses to unlink a file another process has open, so the caller's unlink is the probe.
     """
     proc = Path("/proc")
-    if not (proc / "self" / "fd").is_dir():
+    if (proc / "self" / "fd").is_dir():
+        target = os.path.realpath(path)
+        inside = os.path.realpath(root) + os.sep if root is not None else None
+
+        def name(pid_dir: Path) -> str:
+            try:
+                argv = (pid_dir / "cmdline").read_bytes().split(b"\0")
+                words = [a.decode("utf-8", "replace") for a in argv if a][:3]
+                if words:
+                    return " ".join([os.path.basename(words[0]), *words[1:]])
+            except OSError:
+                pass
+            try:
+                return (pid_dir / "comm").read_bytes().decode("ascii", "replace").strip()  # /proc: Linux only
+            except OSError:
+                return "?"
+
+        for pid_dir in proc.glob("[0-9]*"):
+            try:
+                if any(os.readlink(entry.path) == target for entry in os.scandir(pid_dir / "fd")):
+                    return _Holder(f"pid {pid_dir.name} ({name(pid_dir)})")
+            except OSError:
+                pass
+            if inside is None:
+                continue
+            try:
+                comm = (pid_dir / "comm").read_bytes().decode("ascii", "replace").strip()
+                cwd = os.readlink(pid_dir / "cwd")
+                cmdline = (pid_dir / "cmdline").read_bytes()
+            except OSError:
+                continue
+            if comm == "git" and (cwd + os.sep).startswith(inside) \
+                    and _git_subcommand_of(cmdline) in _LOCK_KEEPING_GIT:
+                return _Holder(f"pid {pid_dir.name} ({name(pid_dir)})")
         return False
-    target = os.path.realpath(path)
-    for fd_dir in proc.glob("[0-9]*/fd"):
-        try:
-            if any(os.readlink(entry.path) == target for entry in os.scandir(fd_dir)):
-                return True
-        except OSError:
-            continue
-    return False
+    import shutil
+
+    lsof = shutil.which("lsof") or next((p for p in ("/usr/sbin/lsof", "/usr/bin/lsof") if os.path.isfile(p)), None)
+    if lsof is None:
+        return None
+    try:
+        found = subprocess.run([lsof, "-F", "pc", "--", str(path)], capture_output=True, text=True, encoding="utf-8",
+                               errors="replace", timeout=20,
+                               stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    pids = [line[1:] for line in found.stdout.splitlines() if line.startswith("p")]
+    if pids:
+        names = [line[1:] for line in found.stdout.splitlines() if line.startswith("c")]
+        return _Holder(f"pid {pids[0]} ({names[0] if names else '?'})")
+    return False if found.returncode in (0, 1) else None  # lsof exits 1 when nothing has the file open
 
 
-def _release_dead_index_lock(git_dir: Path) -> bool:
-    """Drop the killed git's ``index.lock`` (it refuses every git command); False while a live git holds it."""
+def _index_lock_holder(git_dir: Path, root: Path | None) -> str:
+    """Who keeps ``index.lock`` for the user-facing message: ``pid N (name)`` when it can be named."""
+    held = None if sys.platform == "win32" else _held_open(git_dir / "index.lock", root)
+    return f"a running git ({held})" if isinstance(held, _Holder) else "a running git"
+
+
+def _release_dead_index_lock(git_dir: Path, root: Path | None = None) -> bool:
+    """Drop a killed git's ``index.lock`` (it refuses every git command) once its owner is PROVEN gone.
+
+    False while a live git may hold it, or when this platform cannot prove it dead: the caller then
+    keeps the interrupted-pull marker, so the next launch tries again instead of a rollback being lost.
+    """
     lock = git_dir / "index.lock"
     deadline = time.monotonic() + 5
     while lock.exists():
-        if not _held_open(lock):
+        held = None if sys.platform == "win32" else _held_open(lock, root)
+        if held is False or sys.platform == "win32":
             try:
                 lock.unlink()
                 return True
@@ -425,14 +535,179 @@ def _release_dead_index_lock(git_dir: Path) -> bool:
                 return True
             except PermissionError:  # Windows: open in a live process
                 pass
+        elif held is None:
+            return False
         if time.monotonic() > deadline:
             return False
         time.sleep(0.1)
     return True
 
 
-def restore_interrupted_pull(project_root: Path | None = None) -> bool:
+# The ZIP update's equivalent of the interrupted-pull marker: a journal in the install root naming
+# every entry the swap stages/renames and whether it existed before, plus an OS lock its owner holds
+# for the whole stage+swap (the kernel drops it with the owner: liveness without pids or ages).
+ZIP_SWAP_JOURNAL = ".hermes-update-zip-swap"
+_ZIP_STAGING_SUFFIX, _ZIP_OLD_SUFFIX = ".hermes-update-staging", ".hermes-update-old"
+
+
+class ZipSwapLock:
+    """``zip_swap_owner_lock``'s verdict: truthy only while this process holds the kernel lock.
+
+    ``reason`` names a refusal: ``busy`` (a live owner holds it) or why no lock could be taken at all.
+    """
+
+    __slots__ = ("owned", "reason")
+
+    def __init__(self, owned: bool, reason: str = "") -> None:
+        self.owned, self.reason = owned, reason
+
+    def __bool__(self) -> bool:
+        return self.owned
+
+
+@contextlib.contextmanager
+def zip_swap_owner_lock(root: Path, *, wait: float = 0.0):
+    """Yields a truthy ``ZipSwapLock`` while this process owns the ZIP swap lock, a falsy one otherwise.
+
+    The lock file is a stable sidecar: never unlinked, so every process locks the same inode (an
+    unlink lets a waiter keep the old inode while a newcomer locks a fresh one). No lock, no admission:
+    a root where the file cannot be opened or locked refuses with the reason (fail closed)."""
+    lock_path = Path(root) / (ZIP_SWAP_JOURNAL + ".lock")
+    try:
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError as exc:
+        yield ZipSwapLock(False, f"cannot open the ZIP swap lock {lock_path}: {exc.strerror or exc}")
+        return
+    try:
+        deadline = time.monotonic() + wait
+        while True:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if exc.errno not in _CLAIM_HELD_ERRNOS:
+                    yield ZipSwapLock(False, f"cannot lock the ZIP swap lock {lock_path}: {exc.strerror or exc}")
+                    return
+            if time.monotonic() >= deadline:
+                yield ZipSwapLock(False, "busy")
+                return
+            time.sleep(0.05)
+        try:
+            yield ZipSwapLock(True)
+        finally:
+            _lock_fd(fd, False)
+    finally:
+        os.close(fd)
+
+
+def write_zip_swap_journal(root: Path, phase: str, entries: list) -> None:
+    import json
+
+    journal = Path(root) / ZIP_SWAP_JOURNAL
+    tmp = journal.with_name(journal.name + ".tmp")
+    tmp.write_text(json.dumps({"pid": os.getpid(), "phase": phase, "entries": entries}), encoding="utf-8")
+    os.replace(tmp, journal)
+
+
+def _drop_path(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        import shutil
+        import stat
+
+        try:
+            shutil.rmtree(path)
+        except OSError:
+            # A staged copy keeps its source's modes: a read-only directory refuses to give up its
+            # entries. These trees are the update's own copies, so make them writable and retry.
+            rwx = stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
+            os.chmod(path, os.stat(path).st_mode | rwx)
+            for dirpath, dirnames, files in os.walk(path):
+                for name in (*dirnames, *files):
+                    child = os.path.join(dirpath, name)
+                    if not os.path.islink(child):  # about to be deleted: only the owner bits matter
+                        os.chmod(child, os.stat(child).st_mode | (rwx if name in dirnames else stat.S_IWUSR))
+            shutil.rmtree(path)
+    elif path.exists() or path.is_symlink():
+        path.unlink()
+
+
+def restore_interrupted_zip_swap(project_root: Path | None = None) -> bool:
+    """Finish or roll back a ZIP swap whose owner died; True when the tree changed (relaunch).
+
+    ``committed``: every rename landed, only backups remain -> drop them (finish). ``swapping``: put
+    each moved-aside entry back and remove entries the swap added (roll back to the old tree, which
+    the venv was built for; ``hermes update`` redoes it). ``staging``: nothing live moved -> drop the
+    staging copies. Either way no ``*.hermes-update-staging``/``-old`` sibling is left to wedge the
+    next run's free-space or dirty-tree checks. A live owner (lock held) is never second-guessed.
+    """
+    root = _project_root() if project_root is None else Path(project_root)
+    journal = root / ZIP_SWAP_JOURNAL
+    if not journal.is_file() or _pytest_owns_live_checkout(root):
+        return False
+    with zip_swap_owner_lock(root) as owned:
+        if not owned and owned.reason != "busy":
+            print(f"⚠ An interrupted ZIP update cannot be settled: {owned.reason}.", file=sys.stderr)
+        if not owned or not journal.is_file():
+            return False
+        import json
+
+        try:
+            data = json.loads(journal.read_text(encoding="utf-8-sig"))
+            phase, entries = data["phase"], [(str(n), bool(e)) for n, e in data["entries"]]
+        except (OSError, ValueError, KeyError, TypeError):
+            phase, entries = "staging", []  # unreadable: never guess which live entry to move
+        changed = False
+        failed = False
+        for name, existed in reversed(entries):
+            if not name or "/" in name or "\\" in name or name in (".", ".."):
+                continue
+            dst = root / name
+            staging, old = Path(f"{dst}{_ZIP_STAGING_SUFFIX}"), Path(f"{dst}{_ZIP_OLD_SUFFIX}")
+            try:
+                if phase == "swapping":
+                    # Staging finished before this phase, so a backup now is the one the swap made
+                    # from the old entry: it existed, whatever an older journal recorded.
+                    existed = existed or old.exists()
+                    if existed and old.exists():
+                        if old.is_file() and not old.is_symlink() and not dst.is_dir():
+                            os.replace(old, dst)  # a file entry never goes missing, not even here
+                        else:
+                            _drop_path(dst)
+                            os.rename(old, dst)
+                        changed = True
+                    elif not existed and dst.exists() and not staging.exists():
+                        _drop_path(dst)
+                        changed = True
+                elif existed and not dst.exists() and old.exists():
+                    os.rename(old, dst)  # the backup is the only copy left
+                    changed = True
+                for leftover in (staging, old):
+                    _drop_path(leftover)
+            except OSError as exc:
+                failed = True
+                print(f"⚠ Could not settle {name} after an interrupted ZIP update: {exc}", file=sys.stderr)
+        if failed:
+            return changed  # the journal stays: the next launch retries
+        journal.unlink(missing_ok=True)
+    if changed:
+        print("⚠ A previous ZIP `hermes update` was interrupted mid-swap; the old install was put back. "
+              "`hermes update` updates it again.", file=sys.stderr)
+    return changed
+
+
+def restore_interrupted_pull(project_root: Path | None = None, *, after_failure: bool = False) -> bool:
     """Put back the files a killed ``hermes update`` had half-moved to the new commit.
+
+    ``after_failure``: the updater itself calls this when git exited non-zero mid-move (a locked or
+    read-only file): same restore, and the marker stays whenever the tree is not verified whole.
 
     Returns True when the tree changed under this process: modules it already imported may be the
     half-written ones, so the caller must relaunch (``relaunch_after_restore``).
@@ -452,7 +727,21 @@ def restore_interrupted_pull(project_root: Path | None = None) -> bool:
     try:
         root = _project_root() if project_root is None else project_root
         marker = interrupted_pull_marker(root)
-        if not marker.is_file() or _pytest_owns_live_checkout(root):
+        if not marker.is_file() and not (Path(root) / ZIP_SWAP_JOURNAL).is_file():
+            return False  # fast path: nothing to repair, no lock taken
+        if _pytest_owns_live_checkout(root):
+            return False
+        # A live `hermes update` (or its build/completion/git, after its updater died) owns the
+        # checkout: its own transaction settles the tree, and repairing under it races its git.
+        busy_note = "⚠ Not repairing the checkout now: {}. Launch again once it finishes."
+        if (Path(root) / ZIP_SWAP_JOURNAL).is_file():
+            with _checkout_custody(Path(root)) as busy:
+                if busy:
+                    print(busy_note.format(busy), file=sys.stderr)
+                    return False
+                if restore_interrupted_zip_swap(root):
+                    return True
+        if not marker.is_file():
             return False
         with _restore_claim(marker.parent) as claimed:
             if not claimed:
@@ -461,14 +750,54 @@ def restore_interrupted_pull(project_root: Path | None = None) -> bool:
                 return False
             if not marker.is_file():
                 return True  # another launch finished while this one started: rerun from its tree
-            return _restore_holding_claim(root, marker)
+            # The claim orders launches; the checkout lock keeps out an update tree. Claim first, so a
+            # launch that waited out another's repair reruns from its tree without contending.
+            with _checkout_custody(Path(root)) as busy:
+                if busy:
+                    print(busy_note.format(busy), file=sys.stderr)
+                    return False
+                return _restore_holding_claim(root, marker, after_failure=after_failure)
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
         # Never block launch: the import that follows surfaces any real breakage.
         print(f"⚠ Could not check for an interrupted `hermes update`: {exc}", file=sys.stderr)
     return False
 
 
-def _restore_holding_claim(root: Path, marker: Path) -> bool:
+@contextlib.contextmanager
+def _checkout_custody(root: Path):
+    """Hold the checkout kernel lock (``hermes_cli.update_lock``) for a repair, like an updater (R2).
+
+    Yields ``""`` while this process holds or joined it (the updater's own ``after_failure``
+    settle and its children join), else the busy reason: a live update tree owns the checkout and
+    the repair leaves the tree alone. The restore's mutating git children inherit the lock (POSIX)
+    or join this process's kill-on-close job (Windows) through ``update_custody.run_git``, so a
+    launch killed mid-restore keeps the checkout locked until its git is gone.
+
+    A tree too torn to import the lock module still gets its repair (this is the code that untears
+    it); no updater can be running from such a tree.
+    """
+    try:
+        from hermes_cli import update_lock
+    except Exception as exc:  # noqa: BLE001 - torn tree: repair without the lock rather than never
+        print(f"⚠ Repairing without the checkout lock ({type(exc).__name__}: {exc}).", file=sys.stderr)
+        yield ""
+        return
+    holder = update_lock._acquire_checkout(Path(root))
+    if holder is not None:
+        if not update_lock.checkout_lock_held(Path(root)):
+            # Not a holder but no lock at all (a git dir without working locks, e.g. NFS without
+            # lockd): no updater can hold it either (they fail closed), so the repair runs unguarded.
+            yield ""
+            return
+        yield update_lock.describe_holder(holder) or "another update holds the checkout lock"
+        return
+    try:
+        yield ""
+    finally:
+        update_lock._release_checkout()
+
+
+def _restore_holding_claim(root: Path, marker: Path, *, after_failure: bool = False) -> bool:
     global _merge_advice_shown
     git_dir = marker.parent
     fields = dict(line.partition("=")[::2] for line in marker.read_text(encoding="utf-8-sig").splitlines())
@@ -484,12 +813,46 @@ def _restore_holding_claim(root: Path, marker: Path) -> bool:
     pre, target = fields.get("pre", "").strip(), fields.get("target", "").strip()
     stash = fields.get("stash", "").strip()
 
-    def git(*args: str, stdin: str | None = None) -> subprocess.CompletedProcess:
-        return subprocess.run(["git", "--literal-pathspecs", "-C", str(root), *args], input=stdin,
-                              capture_output=True, text=True, encoding="utf-8", errors="replace",
-                              timeout=120, stdin=None if stdin is not None else subprocess.DEVNULL)
+    executable = _git_executable()
+    try:
+        from hermes_cli.update_custody import run_git
+    except Exception:  # noqa: BLE001 - torn tree: plain spawns (see _checkout_custody)
+        run_git = None
 
-    if not pre or not target or git("rev-parse", "HEAD").stdout.strip() != pre:
+    def git(*args: str, stdin: str | None = None, text: bool = True) -> subprocess.CompletedProcess:
+        base = [executable, "--literal-pathspecs", "-C", str(root)]
+        kwargs = dict(input=stdin, cwd=str(root), capture_output=True, timeout=120,
+                      stdin=None if stdin is not None else subprocess.DEVNULL,
+                      **({"text": True, "encoding": "utf-8", "errors": "replace"} if text else {}))
+        if run_git is not None:
+            return run_git(base, list(args), **kwargs)
+        return subprocess.run([*base, *args], **kwargs)
+
+    # A killed git's index.lock goes first, before any git runs (an unresolvable or failing git
+    # would otherwise strand it, and it refuses every later git command). Proven-dead only; after a
+    # git that EXITED (``after_failure``) a lock now is another git's, never ours to drop.
+    foreign_lock = after_failure and (git_dir / "index.lock").exists()
+    index_free = foreign_lock or _release_dead_index_lock(git_dir, root)
+
+    rollback = fields.get("rollback", "").strip()
+    rollback = rollback if rollback in ("branch", "detach") else ""
+    head = git("rev-parse", "HEAD")
+    if head.returncode != 0:
+        print(f"⚠ Could not read HEAD to repair an interrupted `hermes update` ({head.stderr.strip()}); "
+              "the next launch retries.", file=sys.stderr)
+        return False
+    if rollback and pre and target and head.stdout.strip() == target:
+        # A syntax rollback killed before it moved HEAD back: redo that step (HEAD and index, no file),
+        # so the restore below lands on ``pre`` (the code the update started from), not the broken tree.
+        # Every step is checked, and the killed step's ``index.lock`` goes first, only once its git is
+        # proven gone: until HEAD is on ``pre`` this marker is the rollback's only record.
+        reason = _redo_rollback_head(git, git_dir, root, pre, rollback, after_failure=after_failure)
+        if reason is not None:
+            print(f"⚠ An interrupted `hermes update` rollback to {pre[:10]} cannot resume yet ({reason}); "
+                  "the next launch retries.", file=sys.stderr)
+            return False
+        head = git("rev-parse", "HEAD")
+    if not pre or not target or head.stdout.strip() != pre:
         marker.unlink()  # git finished (HEAD moved) or the marker is unusable
         return False
     if any((git_dir / name).exists() for name in _GIT_OPERATION_IN_PROGRESS):
@@ -503,19 +866,31 @@ def _restore_holding_claim(root: Path, marker: Path) -> bool:
                   file=sys.stderr)
         return False
     # A killed claim holder's own git child can still be writing; scanning under it reads half a tree.
-    if not _release_dead_index_lock(git_dir):
-        print("⚠ A running git holds the index after an interrupted `hermes update`; the next launch "
-              "finishes the restore.", file=sys.stderr)
+    # After a git that EXITED (``after_failure``) no git of ours is left: a lock now is another git's
+    # (often the very reason ours failed), never ours to drop. The scan below only reads.
+    if not index_free:
+        print(f"⚠ {_index_lock_holder(git_dir, root)} holds the index after an interrupted `hermes update`; "
+              "the next launch finishes the restore.", file=sys.stderr)
         return False
     written = _paths_git_wrote(git, root, pre, target)
     if written is None:  # after a gc or re-clone: nothing left to compare against
+        if rollback and not _rollback_verified(git, git_dir, pre):
+            print(f"⚠ An interrupted `hermes update` rollback to {pre[:10]} is not verified and commit "
+                  f"{target[:10]} is gone. Inspect `git -C {root} status`; `git -C {root} reset --hard "
+                  f"{pre[:10]}` finishes it.", file=sys.stderr)
+            return False
         marker.unlink()
         print(f"⚠ Ignoring a stale interrupted-update marker: commit {target[:10]} is gone.", file=sys.stderr)
         return False
     restore, added, new_dirs = written
+    if (restore or added) and foreign_lock:
+        print("⚠ Another git holds the index, so the files the update already wrote cannot be put back "
+              "now; the next launch restores them.", file=sys.stderr)
+        return False
     if restore or added:
-        print("⚠ A previous `hermes update` was killed while git was writing the new code — "
-              f"restoring the checkout to {pre[:10]}...", file=sys.stderr)
+        print(("⚠ git stopped partway through writing the new code — " if after_failure else
+               "⚠ A previous `hermes update` was killed while git was writing the new code — ")
+              + f"restoring the checkout to {pre[:10]}...", file=sys.stderr)
         failed = _put_back_paths(git, root, restore, added)
         if failed:
             # No manual recipe: a reset would also wipe the edits this restore keeps, and the
@@ -527,6 +902,13 @@ def _restore_holding_claim(root: Path, marker: Path) -> bool:
     for rel in sorted(new_dirs, key=lambda d: d.count("/"), reverse=True):
         with contextlib.suppress(OSError):
             (root / rel).rmdir()  # only when empty: an untracked file inside keeps it
+    if rollback and not _rollback_verified(git, git_dir, pre):
+        # A rollback owns the whole tree (the update parked local edits first): only HEAD on ``pre``
+        # with no tracked change left is a finished rollback. Anything less keeps its only record.
+        print(f"  ✗ The rollback to {pre[:10]} is not verified yet (tracked files still differ); the next "
+              f"launch retries. Inspect `git -C {root} status`; `git -C {root} reset --hard {pre[:10]}` "
+              "finishes it by hand.", file=sys.stderr)
+        return bool(restore or added)
     marker.unlink()
     if not restore and not added:
         return False  # the killed git never reached the tree: nothing to put back
@@ -534,6 +916,37 @@ def _restore_holding_claim(root: Path, marker: Path) -> bool:
     if stash:
         print(f"  Your local changes are still in the update's stash ({stash}).", file=sys.stderr)
     return True
+
+
+def _redo_rollback_head(git, git_dir: Path, root: Path, pre: str, mode: str, *, after_failure: bool) -> str | None:
+    """Move HEAD (and the index) back to ``pre`` for a killed syntax rollback; None, or why not yet.
+
+    The killed step's ``index.lock`` is reclaimed first, and only when its git is proven gone. After a
+    git that exited in this very process (``after_failure``) a lock is never ours to judge.
+    """
+    lock = git_dir / "index.lock"
+    if lock.exists() and (after_failure or not _release_dead_index_lock(git_dir, root)):
+        return f"{_index_lock_holder(git_dir, root)} may still hold .git/index.lock"
+    if mode == "detach":
+        moved = git("update-ref", "--no-deref", "HEAD", pre)
+        if moved.returncode != 0:
+            return f"git update-ref failed: {(moved.stderr.strip().splitlines() or ['?'])[-1]}"
+    reset = git("reset", "-q", pre)
+    if reset.returncode != 0:
+        return f"git reset failed: {(reset.stderr.strip().splitlines() or ['?'])[-1]}"
+    head = git("rev-parse", "HEAD")
+    if head.returncode != 0 or head.stdout.strip() != pre:
+        return "HEAD did not move back"
+    return None
+
+
+def _rollback_verified(git, git_dir: Path, pre: str) -> bool:
+    """The whole-tree rollback landed: HEAD is ``pre``, no index lock, no tracked change."""
+    head = git("rev-parse", "HEAD")
+    if head.returncode != 0 or head.stdout.strip() != pre or (git_dir / "index.lock").exists():
+        return False
+    status = git("status", "--porcelain", "-z", "--untracked-files=no")
+    return status.returncode == 0 and not status.stdout.strip("\0")
 
 
 def _put_back_paths(git, root: Path, restore: list[str], added: list[str]) -> subprocess.CompletedProcess | None:

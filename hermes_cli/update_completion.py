@@ -50,12 +50,19 @@ def run_completion(request: dict) -> dict:
         command = [sys.executable, "-I", "-S", "-u", "-X", f"pycache_prefix={request['bytecode_cache']}",
                    str(root / "hermes_cli/update_completion.py"),
                    str(request_path), str(result_path)]
+        from hermes_cli.update_lock import bind_child_to_update_tree, checkout_lock_fds
+
+        # The child joins the update tree's checkout lock: it inherits the locked fd (POSIX)
+        # or dies with us (Windows job), so the lock is never free while it runs.
         proc = subprocess.Popen(
             command, cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            **({"start_new_session": True} if os.name == "posix" else
+            **({"start_new_session": True, "pass_fds": checkout_lock_fds(root)} if os.name == "posix" else
                {"creationflags": subprocess.CREATE_NO_WINDOW}))
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
         try:
+            # Post-commit: an unbindable child only weakens the lock (logged), never fails the
+            # update; anything else unwinds through the cleanup below, never orphans the child.
+            bind_child_to_update_tree(proc)
             while True:
                 chunk = proc.stdout.read1(8192)
                 sys.stdout.write(decoder.decode(chunk, final=not chunk))
@@ -140,11 +147,10 @@ def _prepare(request: dict, request_path: Path, result_path: Path) -> int:
 
     root = Path(request["source"])
     update_id = request["receipt"]["update_id"]
-    from hermes_cli.venv_sync import (
-        arm_completion, collect_superseded_generations, refuse_foreign_owned_venv,
-    )
+    from hermes_cli.venv_sync import arm_completion, collect_superseded_generations
 
-    refuse_foreign_owned_venv(root)
+    # The foreign-owned-venv refusal runs in the parent BEFORE the swap (update_cmd_commit
+    # .preflight_refusal); the tail was armed there too, so this re-arm is an idempotent backstop.
     arm_completion(root)
     with receipt.worker_context(update_id):
         try:
@@ -163,7 +169,10 @@ def _prepare(request: dict, request_path: Path, result_path: Path) -> int:
                str(request_path), str(result_path), "--prepared"]
     # A second interpreter is mandatory: PM may have selected a different Python
     # and dependency graph. No application maintenance runs in this bootstrap.
-    code = _exit_status(subprocess.call(command, cwd=root, env=activation_environment(root)))
+    from hermes_cli.update_lock import checkout_lock_fds
+
+    code = _exit_status(subprocess.call(command, cwd=root, env=activation_environment(root),
+                                        pass_fds=checkout_lock_fds(root)))
     if not result_path.exists():
         return _failed_result(request, result_path, code)
     return code

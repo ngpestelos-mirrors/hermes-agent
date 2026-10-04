@@ -126,7 +126,11 @@ def test_branch_update_uses_real_refs_and_completion_request(update_tree, monkey
     def fault(command, *args, **kwargs):
         assert Path(command[0]).name.lower() in {'git', 'git.exe'} or command[0] == sys.executable, command
         assert Path(kwargs['cwd']).resolve() in {t.clone, t.origin}, command
-        if 'merge' in command and '--ff-only' in command:
+        # The upstream sync's tree move (`pull upstream main` on older updaters, a local merge of
+        # the fetched `refs/remotes/upstream/main` now) vs the origin fast-forward (`merge --ff-only origin/...`).
+        upstream_move = ('pull' in command or 'merge' in command) and any(
+            arg == 'upstream' or arg.startswith(('upstream/', 'refs/remotes/upstream/')) for arg in command)
+        if 'merge' in command and '--ff-only' in command and not upstream_move:
             if case == 'no-move':
                 return subprocess.CompletedProcess(command, 0, stdout='', stderr='')
             result = run(command, *args, **kwargs)
@@ -136,7 +140,7 @@ def test_branch_update_uses_real_refs_and_completion_request(update_tree, monkey
                 run(['git', 'reset', '--hard', t.base], cwd=t.clone, check=True, capture_output=True)
             return result
         result = run(command, *args, **kwargs)
-        if 'pull' in command and case.startswith('fork-late'):
+        if upstream_move and case.startswith('fork-late'):
             if case.endswith('wrong-branch'):
                 run(['git', 'checkout', '-qb', 'wrong'], cwd=t.clone, check=True, capture_output=True)
             if case.endswith('reverted'):
@@ -321,7 +325,11 @@ def test_stable_zip_consumes_the_same_commit_through_the_real_swap(update_tree, 
             local += '?' + parsed.query
         return real_open(local, *args, **kwargs)
 
-    def guarded_run(command, *args, **kwargs):
+    from hermes_cli import update_custody
+
+    real_custody_run, seam = update_custody.run, threading.local()
+
+    def guard(command, args, kwargs, call):
         nonlocal fetched, failed
         command = list(map(str, command))
         assert Path(command[0]).name.lower() in {'git', 'git.exe'}, command
@@ -334,10 +342,27 @@ def test_stable_zip_consumes_the_same_commit_through_the_real_swap(update_tree, 
         if fetched and not failed and '--abbrev-ref' in command and kwargs.get('check'):
             failed = True
             raise subprocess.CalledProcessError(128, command, '', 'fixture: Git file I/O failed')
-        result = real_run(command, *args, **kwargs)
+        result = call(command, *args, **kwargs)
         if 'fetch' in command:
             fetched = True
         return result
+
+    def guarded_run(command, *args, **kwargs):
+        if getattr(seam, 'custody', False):  # already guarded at the custody seam below
+            return real_run(command, *args, **kwargs)
+        return guard(command, args, kwargs, real_run)
+
+    def custody_call(command, *args, **kwargs):
+        seam.custody = True
+        try:
+            return real_custody_run(command, *args, **kwargs)
+        finally:
+            seam.custody = False
+
+    def guarded_custody_run(command, *args, **kwargs):
+        # The updater's git goes through update_custody.run: on Windows inside an update that is a
+        # suspended Popen bound to the update's job, not subprocess.run, so faults go in here too.
+        return guard(command, args, kwargs, custody_call)
 
     if transport in {'gitless', 'no-git'}:
         (t.clone / '.git').rename(tmp_path / 'git-state')
@@ -346,6 +371,7 @@ def test_stable_zip_consumes_the_same_commit_through_the_real_swap(update_tree, 
     before = (t.clone / 'content.txt').read_bytes()
     monkeypatch.setattr(urllib.request, 'urlopen', local_open)
     monkeypatch.setattr(subprocess, 'run', guarded_run)
+    monkeypatch.setattr(update_custody, 'run', guarded_custody_run)
     try:
         if transport == 'dirty':
             with pytest.raises(SystemExit) as error:
@@ -426,9 +452,19 @@ def test_update_syntax_failure_restores_pre_update_head(update_tree, monkeypatch
         assert "checkout is on 'unexpected'" in output
         assert 'Rolling back' not in output
     else:
-        assert 'Pulled code has a syntax error' in output
+        # Origin's own target is refused before HEAD moves (the commit point's preflight); an
+        # upstream sync's target is still caught by the post-pull guard and rolled back.
+        assert ('The update target has a syntax error' if sync_phase == 'origin'
+                else 'Pulled code has a syntax error') in output
         assert git(t.clone, 'rev-parse', 'HEAD') == t.base
         assert not (t.clone / 'hermes_cli' / 'config.py').exists()
+    if sync_phase == 'origin' and dirty:
+        # Refused before the autostash too: the local work never left the tree, index included.
+        assert not git(t.clone, 'stash', 'list')
+        assert local.read_bytes() == unstaged
+        assert git(t.clone, 'show', ':.gitignore') == staged.decode().strip()
+        assert (t.clone / 'notes.txt').read_bytes() == b'untracked local work\n'
+        return
     assert not git(t.clone, 'status', '--porcelain')
     assert bool(git(t.clone, 'stash', 'list')) is dirty
     if dirty:

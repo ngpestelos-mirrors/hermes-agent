@@ -18,6 +18,7 @@ from hermes_cli._subprocess_compat import (
     noninteractive_git_env,
     windows_hide_flags,
 )
+from hermes_cli.update_custody import git_argv, run_git
 
 logger = logging.getLogger(__name__)
 
@@ -162,16 +163,16 @@ def disable_tree0_auto_maintenance(repo_root: Path) -> None:
     _migrate_earlier_maintenance_keys(repo_root)
     for key, value in _TREE0_MAINTENANCE_OFF:
         try:
-            current = subprocess.run(
-                ["git", "config", "--local", "--get", key],
+            current = run_git(
+                ["git"], ["config", "--local", "--get", key],
                 cwd=str(repo_root), capture_output=True, text=True,
                 encoding="utf-8", errors="replace", timeout=30,
                 creationflags=windows_hide_flags(),
             ).stdout.strip()
             if current == value:
                 continue
-            subprocess.run(
-                ["git", "config", "--local", key, value],
+            run_git(
+                ["git"], ["config", "--local", key, value],
                 cwd=str(repo_root), check=True,
                 capture_output=True, text=True,
                 encoding="utf-8", errors="replace", timeout=30,
@@ -199,8 +200,8 @@ def _migrate_earlier_maintenance_keys(repo_root: Path) -> None:
                 or "maintenance.commit-graph.enabled" in local):
             return
         for key in ("maintenance.auto", "gc.auto") if local.get("gc.auto") == "0" else ("maintenance.auto",):
-            subprocess.run(
-                ["git", "config", "--local", "--unset", key],
+            run_git(
+                ["git"], ["config", "--local", "--unset", key],
                 cwd=str(repo_root), check=True, capture_output=True, timeout=30,
                 creationflags=windows_hide_flags(),
             )
@@ -232,8 +233,8 @@ def clear_stale_tmp_packs(repo_root: Path, *, min_age_seconds: Optional[int] = N
 def _git_stdout_lines(repo_root: Path, args: List[str]) -> List[str]:
     """Run a read-only git query in ``repo_root``; [] on any failure."""
     try:
-        result = subprocess.run(
-            ["git", *args], cwd=str(repo_root),
+        result = run_git(
+            ["git"], [*args], cwd=str(repo_root),
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10,
             creationflags=windows_hide_flags(),
         )
@@ -258,8 +259,8 @@ def _batch_missing_parents(repo_root: Path, candidates: List[str]) -> set[str]:
         parents_by_commit = {}
         parents = set()
         request = "\n".join(candidates) + "\n"
-        result = subprocess.run(
-            ["git", "cat-file", "--batch"],
+        result = run_git(
+            ["git"], ["cat-file", "--batch"],
             cwd=str(repo_root),
             input=request.encode(),
             capture_output=True,
@@ -296,8 +297,8 @@ def _batch_missing_parents(repo_root: Path, candidates: List[str]) -> set[str]:
                 return set()
         if not parents:
             return set()
-        check = subprocess.run(
-            ["git", "cat-file", "--batch-check"],
+        check = run_git(
+            ["git"], ["cat-file", "--batch-check"],
             cwd=str(repo_root),
             input=("\n".join(sorted(parents)) + "\n").encode(),
             capture_output=True,
@@ -380,8 +381,8 @@ def repair_broken_shallow_boundaries(repo_root: Path) -> int:
         if shallow_path is None:
             return 0
         # Cheap gate: repair only when the walk the corruption breaks already fails.
-        probe = subprocess.run(
-            ["git", "rev-list", "--count", "--all", "--reflog"],
+        probe = run_git(
+            ["git"], ["rev-list", "--count", "--all", "--reflog"],
             cwd=str(repo_root), capture_output=True, timeout=10,
             creationflags=windows_hide_flags(),
         )
@@ -474,8 +475,8 @@ def prune_stale_shallow_grafts(repo_root: Path) -> int:
             ):
                 entries = _git_stdout_lines(repo_root, ["reflog", "show", "--format=%H", ref])
                 if set(entries) & dropped:
-                    subprocess.run(
-                        ["git", "reflog", "expire", "--expire=now", ref],
+                    run_git(
+                        ["git"], ["reflog", "expire", "--expire=now", ref],
                         cwd=str(repo_root), capture_output=True, timeout=10,
                         creationflags=windows_hide_flags(),
                     )
@@ -500,15 +501,15 @@ def prune_stale_shallow_grafts(repo_root: Path) -> int:
 
 def _partial_clone_filter(repo_root: Path, **run_kwargs) -> "str | None":
     """The checkout's own ``remote.origin.partialclonefilter``, or None for a non-partial clone."""
-    result = subprocess.run(
-        ["git", "config", "--get", "remote.origin.promisor"],
+    result = run_git(
+        ["git"], ["config", "--get", "remote.origin.promisor"],
         cwd=str(repo_root), capture_output=True, text=True,
         encoding="utf-8", errors="replace", timeout=30, **run_kwargs,
     )
     if result.returncode != 0 or result.stdout.strip().lower() != "true":
         return None
-    configured = subprocess.run(
-        ["git", "config", "--get", "remote.origin.partialclonefilter"],
+    configured = run_git(
+        ["git"], ["config", "--get", "remote.origin.partialclonefilter"],
         cwd=str(repo_root), capture_output=True, text=True,
         encoding="utf-8", errors="replace", timeout=30, **run_kwargs,
     )
@@ -553,8 +554,8 @@ def fetch_full_commit_graph(repo_root: Path, *extra_refspecs: str, **run_kwargs)
     if converts:
         fetch_filter = "tree:0"
     try:
-        subprocess.run(
-            ["git", "fetch", "--quiet", *(["--unshallow"] if shallow else []),
+        run_git(
+            ["git"], ["fetch", "--quiet", *(["--unshallow"] if shallow else []),
              *([f"--filter={fetch_filter}"] if fetch_filter else []),
              "--no-tags", "origin", "refs/tags/v*:refs/tags/v*", *extra_refspecs],
             cwd=str(repo_root), check=True, capture_output=True, text=True,
@@ -641,8 +642,10 @@ def consolidate_lazy_fetch_packs(repo_root: Path, *,
         limit = _gc_auto_pack_limit(repo_root)
         if on_fold_start is not None and 0 < limit < before:
             on_fold_start(before)
+        # Object store only (no worktree/index/refs): no lock fd. Its own runner bounds and
+        # tree-kills it (Windows: a kill-on-close job of ours); git_argv adds the no-detach config.
         if bounded_probe_run(
-            ["git", "-c", "gc.autoDetach=false", "-c", "gc.writeCommitGraph=false", "gc", "--auto"],
+            git_argv(["git"], ["-c", "gc.writeCommitGraph=false", "gc", "--auto"]),
             timeout=LAZY_FETCH_GC_TIMEOUT_SECONDS, cwd=str(repo_root),
             env={**noninteractive_git_env(), **NO_LAZY_FETCH_ENV},
         ) is None:

@@ -17,6 +17,11 @@ from hermes_cli.update_inventory import RuntimeRecord, UpdatePlan
 import hermes_yaml
 
 
+def _swap_leftovers(root):
+    """Staging/backup siblings and the journal; the swap lock is a stable sidecar that stays (one inode)."""
+    return [p for p in root.glob("*.hermes-update-*") if p.name != ".hermes-update-zip-swap.lock"]
+
+
 @pytest.fixture
 def zip_update(tmp_path, monkeypatch, isolated_source_completion):
     home = tmp_path / "home"
@@ -151,7 +156,7 @@ def test_zip_command_migrates_profiles_recovers_snapshot_and_verifies_fleet(
     assert receipt["runtime_outcomes"][0]["outcome"] == "restarted"
     assert update_receipt._current.get() is None
     assert state.token["resume_needed"] is False
-    assert not list(state.root.glob("*.hermes-update-*"))
+    assert not _swap_leftovers(state.root)
 
 
 @pytest.mark.parametrize("verdict", ["healthy", "unsafe-sqlite", "stale-fleet"])
@@ -204,15 +209,16 @@ def test_zip_failure_recovers_pause_without_completion_mutations(zip_update, mon
     monkeypatch.setattr(update_cmd, "_git_run", fail_fetch)
     installed = []
     if failure in {"swap", "late-swap"}:
-        rename = os.rename
-
-        def fail_second_swap(src, dst):
-            if str(src).endswith(".hermes-update-staging"):
-                installed.append(dst)
-                if len(installed) == (5 if failure == "late-swap" else 2):
-                    raise OSError("locked replacement")
-            return rename(src, dst)
-        monkeypatch.setattr(os, "rename", fail_second_swap)
+        def failing_nth_swap(move):  # root files swap by os.replace, directories by os.rename
+            def fail_second_swap(src, dst):
+                if str(src).endswith(".hermes-update-staging"):
+                    installed.append(dst)
+                    if len(installed) == (5 if failure == "late-swap" else 2):
+                        raise OSError("locked replacement")
+                return move(src, dst)
+            return fail_second_swap
+        monkeypatch.setattr(os, "rename", failing_nth_swap(os.rename))
+        monkeypatch.setattr(os, "replace", failing_nth_swap(os.replace))
         expected = SystemExit
     elif failure == "stage":
         import shutil
@@ -239,15 +245,15 @@ def test_zip_failure_recovers_pause_without_completion_mutations(zip_update, mon
         assert (state.root / "pyproject.toml").read_bytes() == old_project
         assert (state.root / "payload.txt").read_text() == "old"
     if failure != "preparation":
-        assert {p.relative_to(state.root): p.read_bytes()
-                for p in state.root.rglob("*") if p.is_file()} == original_tree
+        assert {p.relative_to(state.root): p.read_bytes() for p in state.root.rglob("*")
+                if p.is_file() and p.name != ".hermes-update-zip-swap.lock"} == original_tree
     assert state.events == ["resume"]
     assert state.token["resume_needed"] is False
     assert {profile: (profile / "config.yaml").read_bytes() for profile in before} == before
     assert not (state.sibling / ".env").exists()
     assert json.loads(state.jobs.read_text()) == state.original_jobs
     assert not (state.active / "logs/update_receipts/latest.json").exists()
-    assert not list(state.root.glob("*.hermes-update-*"))
+    assert not _swap_leftovers(state.root)
 
 
 @pytest.mark.parametrize("entry", ["payload.txt", "tools"])
@@ -275,10 +281,10 @@ def test_zip_recovers_crashed_backup_before_failed_copy_and_retry(zip_update, mo
         assert error.value.code == 1
     witness = target / "code.py" if entry == "tools" else target
     assert witness.read_text(encoding="utf-8") == ("retained" if entry == "tools" else "old")
-    assert not list(root.glob("*.hermes-update-*"))
+    assert not _swap_leftovers(root)
     update_cmd_zip._download_and_swap_zip("main", "local fixture")
     assert witness.read_text(encoding="utf-8") == "new"
-    assert not list(root.glob("*.hermes-update-*"))
+    assert not _swap_leftovers(root)
 
 
 def test_atomic_directory_compat_entrypoint(tmp_path):
@@ -290,7 +296,7 @@ def test_atomic_directory_compat_entrypoint(tmp_path):
     update_cmd_zip._atomic_replace_dir(str(src), str(dst))
     assert {p.name for p in dst.iterdir()} == {"new"}
     assert (dst / "new").read_text(encoding="utf-8") == "new"
-    assert not list(tmp_path.glob("*.hermes-update-*"))
+    assert not _swap_leftovers(tmp_path)
 
 
 def test_zip_refuses_non_main_before_transport(zip_update, monkeypatch, capsys):
