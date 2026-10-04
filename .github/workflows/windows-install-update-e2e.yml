@@ -63,6 +63,14 @@ jobs:
           test-environment: 'true'
           prune-python-cache: true
 
+      - name: R6 custody live tests (updater git/Node join the owner's kill-on-close job)
+        shell: bash
+        continue-on-error: true  # proof signal only; the E2E below is the acceptance verdict
+        run: |
+          scripts/run_tests.sh tests/hermes_cli/test_update_lock_windows_live.py tests/hermes_cli/test_update_target_identity.py -- -m platforms -v --tb=long -rA
+        env:
+          HERMES_TEST_FILE_RETRIES: '0'
+
       - name: Run Windows install + update E2E
         shell: bash
         run: |
