@@ -103,14 +103,14 @@ STARTED_AT="$(date +%s)"  # the shim's elapsed clock; see serve-ui.py
 
 UI_SERVER_PID="" UI_BROWSER_PID="" UI_PANEL_PID="" UI_PROFILE_DIR="" FINAL_CODE=1
 FINAL_MSG="update did not complete"
-DONE_NOTE=""  # set when the update succeeded but the app will NOT reopen itself
+DONE_NOTE=""  # set when the update succeeded but the user must act (reopen, reinstall, rebuild)
 # Follow-up work that failed AFTER `hermes update` committed the new code. The
 # result stays ok:true (contract C3: ok:false only while still on the previous
 # version); each entry reaches the Desktop as a warning.
 WARNINGS=()
 MARKER_BODY=""  # the claim we published (logging; release judges identity, not bytes)
 MARKER_CLAIMED=0
-APP_REBUILD_FAILED=0
+APP_REBUILD_FAILED=0  # 1 = the code committed but the Desktop app build is an owed follow-up
 
 log() {
   if [ -n "$MARKER_OP" ]; then echo "$(date +%Y-%m-%dT%H:%M:%S%z) $1" >> "$LOG" 2>/dev/null
@@ -532,6 +532,7 @@ mac_swap() {
   # user always has a launchable app, and the result file tells the truth.
   # The code update already committed, so every failure here is a follow-up
   # warning on an ok:true result, never "still on the previous version".
+  # A failed rebuild left release/ holding the OLD build: nothing new to install.
   if [ "$FINAL_CODE" -eq 0 ] && [ "$APP_REBUILD_FAILED" -eq 0 ] && [ -n "$rebuilt" ] \
       && [ -d "$RELAUNCH_TARGET" ] && [ "$rebuilt" != "$RELAUNCH_TARGET" ]; then
     publish_stage "Installing the new app"
@@ -574,7 +575,7 @@ deliver_outcome() { # the truth-determining half: swap bundles / gate the relaun
   else
     linux_gate
     if [ "$GATE" != "relaunch" ] && [ "$FINAL_CODE" -eq 0 ]; then
-      DONE_NOTE="$GATE_MSG"
+      DONE_NOTE="${DONE_NOTE:+$DONE_NOTE }$GATE_MSG"
       add_warning "relaunch" "$GATE: $GATE_MSG"
     fi
   fi
@@ -663,9 +664,10 @@ finish() {
 
   if [ -n "$DONE_NOTE" ]; then
     if [ "$GATE" != "skew" ] && [ "$GATE" != "manual" ]; then
-      # A kept/rolled-back mac bundle or a failed post-commit follow-up: bring
-      # the app back up; the note still tells the user what to re-run. A gated
-      # linux outcome (skew/manual) skips the launch BY DESIGN.
+      # A kept/rolled-back mac bundle, a failed post-commit follow-up or an owed
+      # Desktop rebuild (any OS): bring the app back up; the note still tells the
+      # user what to re-run. A gated linux outcome (skew/manual) skips the launch
+      # BY DESIGN.
       if ! launch_app; then
         # Even the kept bundle didn't come back: the durable message must
         # carry BOTH facts (update ok, previous app not reopened).
@@ -1132,6 +1134,15 @@ fi
 trap 'on_signal TERM' TERM
 
 if [ "$CODE" -eq 0 ]; then FINAL_CODE=0 FINAL_MSG="Update complete."
+  # Contract C3: a Desktop build that fails after the code committed is an owed
+  # follow-up (hermes update exits 0 and prints it). The user is on the new
+  # Hermes, but this app was not rebuilt: say so and say how to fix it, never
+  # "finished OK" and never "still on the previous version".
+  if printf '%s' "$OUT" | grep -Eq "Update follow-up 'build' did not finish: .*(desktop app build|Node dependencies)"; then
+    APP_REBUILD_FAILED=1
+    DONE_NOTE="Hermes was updated, but the Desktop app could not be rebuilt, so it still runs its old build. Run hermes desktop --force-build in a terminal to rebuild it; the update log has the build error."
+    add_warning "build" "desktop app build is an owed follow-up of the committed update"
+  fi
 else
   FINAL_CODE="$CODE" FINAL_MSG="Update failed (exit $CODE). Run hermes debug share in a terminal to send a report."
   # The bricked-venv class is fixable and must not read as a generic exit 1:
