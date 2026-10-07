@@ -1,0 +1,45 @@
+name: tmp routing probe
+on:
+  push:
+    branches: [tmp/flake-ci-routing-probe]
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: windows-latest-32-arm-core
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+      - uses: ./.github/actions/setup-windows-build-deps
+      - uses: ./.github/actions/setup-pm
+        with:
+          packages: 'git,ripgrep'
+          extras: '["all", "telegram", "anthropic", "mistral", "fal", "modal", "daytona", "parallel-web"]'
+          test-environment: 'true'
+          save-tools-cache: 'false'
+          save-python-cache: 'false'
+      - name: Loop the replay under load
+        shell: bash
+        run: |
+          set -u
+          fails=0; total=0
+          mkdir -p "$RUNNER_TEMP/probe"
+          for round in 1 2 3 4; do
+            pids=()
+            for i in $(seq 1 16); do
+              python -m pytest tests/ci/test_update_ci_routing.py -m "platforms and not integration" \
+                -k "test_replay_rejects_ineffective_required_step or dispatches_its_suites" \
+                -p no:cacheprovider -q --tb=short > "$RUNNER_TEMP/probe/r$round-$i.log" 2>&1 &
+              pids+=($!)
+            done
+            for idx in "${!pids[@]}"; do
+              total=$((total+1))
+              if ! wait "${pids[$idx]}"; then
+                fails=$((fails+1))
+                echo "=== FAIL round $round copy $((idx+1))"
+                grep -a -E "replayed step exited|^E |FAILED" "$RUNNER_TEMP/probe/r$round-$((idx+1)).log" | head -40
+              fi
+            done
+            echo "round $round done: fails=$fails/$total"
+          done
+          echo "RESULT fails=$fails/$total"
