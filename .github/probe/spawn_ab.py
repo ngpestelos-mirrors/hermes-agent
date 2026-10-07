@@ -8,7 +8,7 @@ git = locate_command("git").command[0]
 interp = os.path.dirname(sys.executable)
 SCRIPT = 'record() { :; }\nx=$(printf a | tr a b)\n[ "$x" = b ]\nif false; then echo no; fi\n'
 d = tempfile.mkdtemp(prefix="ab-")
-script = os.path.join(d, "s.sh"); open(script, "w").write(SCRIPT)
+script = os.path.join(d, "s.sh"); open(script, "w", encoding="utf-8").write(SCRIPT)
 base = {"PATH": os.pathsep.join((interp, os.defpath, os.path.dirname(bash), os.path.dirname(git))),
         "HOME": d, "RUNNER_TEMP": d}
 win = {k: os.environ[k] for k in os.environ if k.upper() in (
