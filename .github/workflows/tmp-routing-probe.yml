@@ -18,28 +18,12 @@ jobs:
           test-environment: 'true'
           save-tools-cache: 'false'
           save-python-cache: 'false'
-      - name: Loop the replay under load
+      - name: Env A/B on Git bash spawns
         shell: bash
         run: |
           set -u
-          fails=0; total=0
-          mkdir -p "$RUNNER_TEMP/probe"
-          for round in 1 2 3 4; do
-            pids=()
-            for i in $(seq 1 16); do
-              python -m pytest tests/ci/test_update_ci_routing.py -m "platforms and not integration" \
-                -k "test_replay_rejects_ineffective_required_step or dispatches_its_suites" \
-                -p no:cacheprovider -q --tb=short > "$RUNNER_TEMP/probe/r$round-$i.log" 2>&1 &
-              pids+=($!)
+          for round in 1 2 3; do
+            for mode in minimal minimal+windows; do
+              python .github/probe/spawn_ab.py "$mode" 1500 32 || true
             done
-            for idx in "${!pids[@]}"; do
-              total=$((total+1))
-              if ! wait "${pids[$idx]}"; then
-                fails=$((fails+1))
-                echo "=== FAIL round $round copy $((idx+1))"
-                grep -a -E "replayed step exited|^E |FAILED" "$RUNNER_TEMP/probe/r$round-$((idx+1)).log" | head -40
-              fi
-            done
-            echo "round $round done: fails=$fails/$total"
           done
-          echo "RESULT fails=$fails/$total"
