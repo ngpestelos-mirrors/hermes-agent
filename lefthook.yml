@@ -2,7 +2,7 @@ pre-commit:
   jobs:
     - name: lint python
       glob: "*.py" # glob filter
-      run: ruff check --config {staged_files}ruff.strict.toml {staged_files}
+      run: ruff check --config {staged_files}
 
     - name: lint web
       root: web/
