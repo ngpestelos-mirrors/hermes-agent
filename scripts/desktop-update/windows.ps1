@@ -1783,7 +1783,6 @@ try {
 } finally {
     # This run's id is ours, not the relaunched Desktop's: the Start-Process rung
     # would hand it on to every update that Desktop starts.
-    Remove-Item -LiteralPath Env:HERMES_UPDATE_CORRELATION_ID -ErrorAction SilentlyContinue
     if (@('claimed', 'adopted') -contains $script:MarkerClaim -and $InstallRoot) {
         # #101789: a Desktop "close and retry" consent belongs to this run alone. One its swap
         # never reached (a failed build) must not let a later update close the program unasked.
