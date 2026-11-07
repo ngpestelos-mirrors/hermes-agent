@@ -63,3 +63,24 @@ async def test_rehomed_receipt_never_restores_under_another_profiles_route(tmp_p
     with pytest.raises(ValueError, match='route mismatch'):
         owned_receipt(authority, ref.session_id)
 
+
+
+@pytest.mark.asyncio
+async def test_picker_offers_an_ended_chat_only_when_resume_would_take_it(tmp_path, authority_for):
+    """The cold picker judges an ended chat by the checks a resume runs: a moved store's chat is
+    offered, one whose route names another profile's namespace is not (resume refuses it)."""
+    from gateway.session_listing import _stored_closed
+    old_home, new_home = str(tmp_path / 'mac' / 'work'), str(tmp_path / 'cloud' / 'work')
+    first = await authority_for(old_home, 'mac')
+    kept, foreign = _create(first, 'kept'), _create(first, 'foreign')
+    for ref in (kept, foreign):
+        receipt = json.loads(first.db.get_meta(POLICY_PREFIX + ref.session_id))
+        first.db.end_session(receipt['entry']['session_id'], 'closed')
+    receipt = json.loads(first.db.get_meta(POLICY_PREFIX + foreign.session_id))
+    first.db.set_meta(POLICY_PREFIX + foreign.session_id,
+                      json.dumps(dict(receipt, route='agent:sibling:local:dm:' + foreign.session_id)))
+
+    moved = await authority_for(new_home, 'cloud')
+    actor = SessionActor('owner', new_home, _CAPS, 'peer')
+    assert _stored_closed(moved, actor, kept.session_id)
+    assert not _stored_closed(moved, actor, foreign.session_id)

@@ -134,15 +134,17 @@ def _closed_local_session(authority, actor, row, tip):
 
 def _stored_closed(authority, actor, owner):
     """Boot leaves an ended session unrestored and a listing never restores one (a worker thread): judge
-    its stored receipt as ``authorize`` and ``closed_and_unviewed`` would after a restore. No viewer."""
-    from hermes_state_local import local_receipt
+    its stored receipt as ``authorize`` and ``closed_and_unviewed`` would after a restore. No viewer.
+    The receipt passes the same read-only checks a restore runs (``owned_receipt``), so the picker
+    never offers a chat that resume refuses."""
+    from gateway.session_local_recovery import owned_receipt
     from hermes_state_runtime import list_session_admissions
     if actor.profile_id != authority.profile_id or 'session:read' not in actor.capabilities:
         return False
     try:
-        receipt = local_receipt(authority.db, owner)
-        row = authority.db.get_session(receipt['entry']['session_id'])
-    except (RuntimeStoreError, KeyError, TypeError):
+        receipt, _source, _route, entry = owned_receipt(authority, owner)
+        row = authority.db.get_session(entry.session_id)
+    except (RuntimeStoreError, KeyError, TypeError, ValueError, AttributeError):
         return False
     return ((same_owner(receipt.get('principal_id'), actor.subject) or 'session:operator' in actor.capabilities)
             and row is not None and row['ended_at'] is not None
